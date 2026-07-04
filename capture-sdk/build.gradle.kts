@@ -43,7 +43,7 @@ afterEvaluate {
                 from(components["release"])
                 groupId = "com.drishtiai"
                 artifactId = "capture-sdk"
-                version = project.findProperty("VERSION_NAME")?.toString() ?: "1.0.0"
+                version = project.findProperty("VERSION_NAME")?.toString() ?: "1.1.0"
             }
         }
     }
@@ -56,8 +56,13 @@ dependencies {
     implementation("androidx.camera:camera-camera2:1.3.4")
     implementation("androidx.camera:camera-lifecycle:1.3.4")
 
+    // Needed for the suspend-fun update-check API (ConfigUpdateManager,
+    // DrishtiCaptureSDK.checkForUpdates()).
+    implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.8.1")
+
     // org.json ships with the Android platform - no extra JSON library
     // needed, keeping the SDK's dependency footprint minimal.
 
     testImplementation("junit:junit:4.13.2")
+    testImplementation("org.jetbrains.kotlinx:kotlinx-coroutines-test:1.8.1")
 }

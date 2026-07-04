@@ -1,69 +1,120 @@
 package com.drishtiai.capture.camera
 
-import android.graphics.Bitmap
-import android.graphics.BitmapFactory
-import android.graphics.ImageFormat
-import android.graphics.Rect
-import android.graphics.YuvImage
 import androidx.camera.core.ImageAnalysis
 import androidx.camera.core.ImageProxy
+import com.drishtiai.capture.model.FrameAnalysisResult
+import com.drishtiai.capture.model.FrameHistoryEntry
 import com.drishtiai.capture.model.QualityConfig
-import com.drishtiai.capture.model.QualityResult
+import com.drishtiai.capture.scoring.ImageUtils
 import com.drishtiai.capture.scoring.ScoringEngine
-import java.io.ByteArrayOutputStream
+import java.util.ArrayDeque
 
 /**
- * CameraX ImageAnalysis.Analyzer integration point. This is a placeholder
- * wiring: it decodes each YUV_420_888 frame to a Bitmap and runs it through
- * ScoringEngine on every analyzed frame. For production use, replace the
- * YUV->JPEG->Bitmap round trip with a direct YUV-to-luma conversion (skip
- * chroma planes entirely - the scoring engine only needs grayscale) to cut
- * per-frame latency; left simple here for MVP clarity.
+ * CameraX `ImageAnalysis.Analyzer` integration point for the *live preview*
+ * path.
+ *
+ * Deliberate behavior split vs. [com.drishtiai.capture.scoring.ScoringEngine.analyzeFrame] (Bitmap overload):
+ * CameraX delivers frames in `YUV_420_888`, and the Y-plane of that format
+ * IS ALREADY luma/grayscale - there is no RGB content to convert from. So
+ * this analyzer reads `image.planes[0]` directly into a DoubleArray
+ * (respecting `rowStride` vs `width`, since a plane's row stride can be
+ * larger than its logical width due to hardware padding) and skips any
+ * YUV->RGB->grayscale conversion entirely. That grayscale array is fed
+ * straight into the exact same [ScoringEngine.analyzeFrame] grayscale-array
+ * core used everywhere else (it doesn't care how the grayscale was
+ * produced), avoiding the previous implementation's wasteful
+ * YUV->NV21->JPEG->Bitmap round-trip for every analyzed frame.
+ *
+ * By contrast, a *captured photo* is scored via
+ * `ScoringEngine.analyzeFrame(bitmap, config)`, which does perform a true
+ * RGBA-weighted grayscale conversion (see [ImageUtils.toGrayscale]) so the
+ * score attached to a saved photo reflects the actual final image, not a
+ * live-preview approximation.
  *
  * Usage (in the host app's CameraX setup):
  *
- *   val analyzer = QualityAnalyzer(configProvider = { sdk.getConfig() }) { result ->
- *       runOnUiThread { updateGuidanceOverlay(result) }
- *   }
+ *   val analyzer = sdk.newCameraAnalyzer { result -> updateGuidanceOverlay(result) }
  *   imageAnalysis.setAnalyzer(cameraExecutor, analyzer)
  */
-class QualityAnalyzer(
+class CameraXAnalyzer(
     private val configProvider: () -> QualityConfig,
-    private val onResult: (QualityResult) -> Unit
+    private val onResult: (FrameAnalysisResult) -> Unit
 ) : ImageAnalysis.Analyzer {
+
+    /** Rolling brightness history feeding ScoringEngine's stability check. */
+    private val brightnessHistory = ArrayDeque<FrameHistoryEntry>()
+    private val maxHistorySize = 32
 
     override fun analyze(image: ImageProxy) {
         try {
-            val bitmap = imageProxyToBitmap(image)
-            if (bitmap != null) {
-                val result = ScoringEngine.score(bitmap, configProvider())
-                onResult(result)
-            }
+            val config = configProvider()
+            val gray = yPlaneToGrayscale(image) ?: return
+
+            val meanBrightness = ImageUtils.mean(gray)
+            recordHistory(meanBrightness)
+
+            val result = ScoringEngine.analyzeFrame(
+                gray = gray,
+                width = image.width,
+                height = image.height,
+                config = config,
+                frameHistory = brightnessHistory.toList()
+            )
+            onResult(result)
         } finally {
             image.close()
         }
     }
 
-    private fun imageProxyToBitmap(image: ImageProxy): Bitmap? {
-        if (image.format != ImageFormat.YUV_420_888) return null
+    private fun recordHistory(meanBrightness: Double) {
+        brightnessHistory.addLast(FrameHistoryEntry(meanBrightness, System.currentTimeMillis()))
+        while (brightnessHistory.size > maxHistorySize) {
+            brightnessHistory.removeFirst()
+        }
+    }
 
-        val yBuffer = image.planes[0].buffer
-        val uBuffer = image.planes[1].buffer
-        val vBuffer = image.planes[2].buffer
+    /**
+     * Reads the Y-plane (`planes[0]`) of a `YUV_420_888` `ImageProxy`
+     * directly into a `DoubleArray` sized `width * height`, without ever
+     * decoding U/V chroma planes. The Y-plane's `rowStride` can exceed
+     * `width` (common on many camera HALs due to memory alignment padding),
+     * so each row is copied respecting that stride rather than assuming
+     * tightly-packed rows.
+     */
+    private fun yPlaneToGrayscale(image: ImageProxy): DoubleArray? {
+        if (image.format != android.graphics.ImageFormat.YUV_420_888) return null
+        if (image.planes.isEmpty()) return null
 
-        val ySize = yBuffer.remaining()
-        val uSize = uBuffer.remaining()
-        val vSize = vBuffer.remaining()
+        val yPlane = image.planes[0]
+        val buffer = yPlane.buffer
+        val rowStride = yPlane.rowStride
+        val pixelStride = yPlane.pixelStride
+        val width = image.width
+        val height = image.height
 
-        val nv21 = ByteArray(ySize + uSize + vSize)
-        yBuffer.get(nv21, 0, ySize)
-        vBuffer.get(nv21, ySize, vSize)
-        uBuffer.get(nv21, ySize + vSize, uSize)
+        val gray = DoubleArray(width * height)
+        val rowBytes = ByteArray(rowStride)
 
-        val yuvImage = YuvImage(nv21, ImageFormat.NV21, image.width, image.height, null)
-        val out = ByteArrayOutputStream()
-        yuvImage.compressToJpeg(Rect(0, 0, image.width, image.height), 90, out)
-        val jpegBytes = out.toByteArray()
-        return BitmapFactory.decodeByteArray(jpegBytes, 0, jpegBytes.size)
+        buffer.rewind()
+        for (row in 0 until height) {
+            val rowStart = row * rowStride
+            buffer.position(rowStart)
+            val bytesToRead = minOf(rowStride, buffer.remaining())
+            buffer.get(rowBytes, 0, bytesToRead)
+
+            val rowOffset = row * width
+            if (pixelStride == 1) {
+                for (col in 0 until width) {
+                    gray[rowOffset + col] = (rowBytes[col].toInt() and 0xFF).toDouble()
+                }
+            } else {
+                for (col in 0 until width) {
+                    val idx = col * pixelStride
+                    gray[rowOffset + col] = (rowBytes[idx].toInt() and 0xFF).toDouble()
+                }
+            }
+        }
+
+        return gray
     }
 }
