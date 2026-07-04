@@ -24,6 +24,32 @@ import kotlin.math.sqrt
 object ImageUtils {
 
     /**
+     * Resizes [bitmap] so its longest edge is at most [maxDimension],
+     * preserving aspect ratio - returns [bitmap] itself (same reference,
+     * not recycled by the caller) if already within bounds. A modern phone
+     * camera photo (12MP+) fed directly into [toGrayscale]/[laplacianVariance]/
+     * [saturationStats] allocates several DoubleArray/IntArray buffers sized
+     * to the full resolution (8-12 bytes PER PIXEL each) - at 12MP that's
+     * 300-500MB of transient allocations in one burst, which is what caused
+     * a real on-device OOM crash analyzing a captured photo. Quality metrics
+     * (blur/contrast/edge-detail/saturation) stay perceptually meaningful at
+     * this resolution - this is standard practice for this class of check,
+     * not a loss of fidelity that matters here - while cutting memory and
+     * CPU cost by roughly (originalPixels / downscaledPixels)x.
+     */
+    fun downscaleForAnalysis(bitmap: Bitmap, maxDimension: Int = 1280): Bitmap {
+        val width = bitmap.width
+        val height = bitmap.height
+        val longestEdge = max(width, height)
+        if (longestEdge <= maxDimension) return bitmap
+
+        val scale = maxDimension.toFloat() / longestEdge.toFloat()
+        val newWidth = (width * scale).toInt().coerceAtLeast(1)
+        val newHeight = (height * scale).toInt().coerceAtLeast(1)
+        return Bitmap.createScaledBitmap(bitmap, newWidth, newHeight, true)
+    }
+
+    /**
      * Converts a decoded Bitmap's ARGB pixels to a single-channel luminance
      * (grayscale) buffer using the standard Rec. 601 luma weights (alpha is
      * ignored, matching sdk-core's RGBA->gray conversion which also ignores

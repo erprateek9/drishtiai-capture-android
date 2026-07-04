@@ -451,6 +451,12 @@ object ScoringEngine {
      * stub) and, when provided, is scored using features extracted from this
      * Bitmap's actual RGBA data (the saturation feature needs color, which
      * the grayscale-only [analyzeFrame] overload never has access to).
+     *
+     * [bitmap] is downscaled once up front via [ImageUtils.downscaleForAnalysis]
+     * before any of the per-pixel analysis below runs - a raw 12MP+ camera
+     * photo fed directly into this pipeline can allocate 300-500MB of
+     * transient buffers in one burst (confirmed OOM crash on-device), which
+     * this avoids while keeping every check's result perceptually equivalent.
      */
     fun analyzeFrame(
         bitmap: Bitmap,
@@ -458,17 +464,28 @@ object ScoringEngine {
         frameHistory: List<FrameHistoryEntry>? = null,
         model: ObjectPresenceModel? = null
     ): FrameAnalysisResult {
-        val gray = ImageUtils.toGrayscale(bitmap)
-        val meanBrightness = ImageUtils.mean(gray)
-        val stdDevValue = ImageUtils.stdDev(gray, meanBrightness)
-        val edgeDensityValue = ImageUtils.edgeDensity(gray, bitmap.width, bitmap.height)
-        val laplacianVarianceValue = ImageUtils.laplacianVariance(gray, bitmap.width, bitmap.height)
+        val analysisBitmap = ImageUtils.downscaleForAnalysis(bitmap)
+        try {
+            val gray = ImageUtils.toGrayscale(analysisBitmap)
+            val meanBrightness = ImageUtils.mean(gray)
+            val stdDevValue = ImageUtils.stdDev(gray, meanBrightness)
+            val edgeDensityValue = ImageUtils.edgeDensity(gray, analysisBitmap.width, analysisBitmap.height)
+            val laplacianVarianceValue = ImageUtils.laplacianVariance(gray, analysisBitmap.width, analysisBitmap.height)
 
-        val features = extractObjectPresenceFeatures(
-            bitmap, gray, meanBrightness, stdDevValue, edgeDensityValue, laplacianVarianceValue
-        )
-        val objectPresence = checkObjectPresence(features, model)
+            val features = extractObjectPresenceFeatures(
+                analysisBitmap, gray, meanBrightness, stdDevValue, edgeDensityValue, laplacianVarianceValue
+            )
+            val objectPresence = checkObjectPresence(features, model)
 
-        return analyzeFrame(gray, bitmap.width, bitmap.height, config, frameHistory, objectPresence)
+            return analyzeFrame(gray, analysisBitmap.width, analysisBitmap.height, config, frameHistory, objectPresence)
+        } finally {
+            // Only recycle the downscaled COPY, never the caller's original
+            // bitmap (createScaledBitmap can return the same instance when no
+            // resize was needed - recycling that would break the caller,
+            // e.g. CaptureRepository already recycles its own bitmap).
+            if (analysisBitmap !== bitmap) {
+                analysisBitmap.recycle()
+            }
+        }
     }
 }
