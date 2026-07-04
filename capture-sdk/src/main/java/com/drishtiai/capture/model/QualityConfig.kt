@@ -198,6 +198,9 @@ data class QualityConfig(
             val maxBrightness = (candidateJson.opt("max_brightness") as Number).toDouble()
             if (minBrightness >= maxBrightness) return false
 
+            val blackFrameThreshold = (candidateJson.opt("black_frame_brightness_threshold") as Number).toDouble()
+            if (blackFrameThreshold >= minBrightness) return false
+
             val overexposedRatio = (candidateJson.opt("overexposed_pixel_ratio_threshold") as Number).toDouble()
             if (overexposedRatio < 0 || overexposedRatio > 1) return false
 

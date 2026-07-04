@@ -1,5 +1,6 @@
 package com.drishtiai.capture.update
 
+import com.drishtiai.capture.model.ObjectPresenceModel
 import com.drishtiai.capture.model.QualityConfig
 import com.drishtiai.capture.storage.PersistentStore
 import kotlinx.coroutines.CoroutineScope
@@ -13,6 +14,7 @@ import java.net.URL
 import java.security.MessageDigest
 
 private const val CONFIG_STORAGE_KEY = "drishtiai.quality_config"
+private const val MODEL_STORAGE_KEY = "drishtiai.object_presence_model"
 private const val TIMEOUT_MS = 8000
 
 /**
@@ -27,6 +29,13 @@ data class SDKVersionInfo(
     val configUrl: String,
     val modelUrl: String?,
     val checksum: String,
+    /**
+     * Checksum of the object-presence model file, kept separate from
+     * [checksum] (which is config-only) now that model publishing is a
+     * real, independent artifact lifecycle. Mirrors sdk-core's
+     * `model_checksum` addition to `SDKVersionInfo`.
+     */
+    val modelChecksum: String? = null,
     val rolloutPercent: Int,
     val forceUpdate: Boolean,
     val publishedAt: String
@@ -39,6 +48,7 @@ data class SDKVersionInfo(
             configUrl = json.getString("config_url"),
             modelUrl = if (json.isNull("model_url")) null else json.getString("model_url"),
             checksum = json.optString("checksum", ""),
+            modelChecksum = if (json.has("model_checksum") && !json.isNull("model_checksum")) json.getString("model_checksum") else null,
             rolloutPercent = json.optInt("rollout_percent", 100),
             forceUpdate = json.optBoolean("force_update", false),
             publishedAt = json.optString("published_at", "")
@@ -48,29 +58,43 @@ data class SDKVersionInfo(
 
 /** Mirrors sdk-core's `UpdateReason` union. */
 enum class UpdateReason {
-    UP_TO_DATE, NEW_CONFIG, FORCED, NOT_IN_ROLLOUT, INVALID_CONFIG, CHECKSUM_MISMATCH, ERROR;
+    UP_TO_DATE, NEW_CONFIG, NEW_MODEL, FORCED, NOT_IN_ROLLOUT, INVALID_CONFIG, INVALID_MODEL, CHECKSUM_MISMATCH, ERROR;
 
     fun toWire(): String = when (this) {
         UP_TO_DATE -> "up_to_date"
         NEW_CONFIG -> "new_config"
+        NEW_MODEL -> "new_model"
         FORCED -> "forced"
         NOT_IN_ROLLOUT -> "not_in_rollout"
         INVALID_CONFIG -> "invalid_config"
+        INVALID_MODEL -> "invalid_model"
         CHECKSUM_MISMATCH -> "checksum_mismatch"
         ERROR -> "error"
     }
 }
 
-/** Result of `checkForUpdates()`. Always returned - never throws. */
+/**
+ * Result of `checkForUpdates()`. Always returned - never throws.
+ *
+ * The `model*` fields are additive siblings of `updateAvailable`/`reason`/
+ * `error` above (which keep their original, config-only meaning) - [model]
+ * is only present and non-null when a NEW model was fetched and validated
+ * during this call.
+ */
 data class UpdateResult(
     val updateAvailable: Boolean,
     val reason: UpdateReason,
     val config: QualityConfig,
     val version: SDKVersionInfo? = null,
-    val error: String? = null
+    val error: String? = null,
+    val modelUpdateAvailable: Boolean = false,
+    val model: ObjectPresenceModel? = null,
+    val modelReason: UpdateReason? = null,
+    val modelError: String? = null
 )
 
 internal data class UpdateDecision(val shouldUpdateConfig: Boolean, val reason: UpdateReason)
+internal data class ModelUpdateDecision(val shouldUpdateModel: Boolean, val reason: UpdateReason)
 
 /** Compares dotted version strings numerically, e.g. "1.2.0" vs "1.10.0". */
 fun compareVersions(a: String, b: String): Int {
@@ -133,6 +157,36 @@ internal fun decideUpdate(currentConfigVersion: String, manifest: SDKVersionInfo
 }
 
 /**
+ * Model-side sibling of [decideUpdate]. A device that has never received a
+ * model (currentModelVersion "0.0.0") and whose manifest has never had one
+ * published (`latestModelVersion == null`) simply has nothing to update to -
+ * this is the permanent, normal state for every device today, not an error.
+ * Uses the same rolloutPercent/forceUpdate gating as config, since
+ * version.json only ever has one instance of each field. Mirrors
+ * sdk-core's `decideModelUpdate` exactly.
+ */
+internal fun decideModelUpdate(currentModelVersion: String, manifest: SDKVersionInfo, deviceId: String): ModelUpdateDecision {
+    if (manifest.latestModelVersion == null) {
+        return ModelUpdateDecision(shouldUpdateModel = false, reason = UpdateReason.UP_TO_DATE)
+    }
+
+    if (manifest.forceUpdate) {
+        return ModelUpdateDecision(shouldUpdateModel = true, reason = UpdateReason.FORCED)
+    }
+
+    val inRollout = rolloutBucket(deviceId) < manifest.rolloutPercent
+    if (!inRollout) {
+        return ModelUpdateDecision(shouldUpdateModel = false, reason = UpdateReason.NOT_IN_ROLLOUT)
+    }
+
+    if (compareVersions(manifest.latestModelVersion, currentModelVersion) > 0) {
+        return ModelUpdateDecision(shouldUpdateModel = true, reason = UpdateReason.NEW_MODEL)
+    }
+
+    return ModelUpdateDecision(shouldUpdateModel = false, reason = UpdateReason.UP_TO_DATE)
+}
+
+/**
  * Best-effort SHA-256 checksum verification using `java.security.MessageDigest`
  * (built into the JDK/Android platform - no extra hashing dependency
  * needed). If no checksum was published, verification is skipped rather
@@ -178,95 +232,133 @@ private fun httpGet(urlString: String): String {
     }
 }
 
+private data class ConfigOutcome(
+    val updateAvailable: Boolean,
+    val reason: UpdateReason,
+    val config: QualityConfig,
+    val error: String? = null
+)
+
+/** Config-only half of the check - unchanged behavior from before model support existed. */
+private suspend fun resolveConfigUpdate(updateUrl: String, manifest: SDKVersionInfo, currentConfig: QualityConfig, deviceId: String): ConfigOutcome {
+    val decision = decideUpdate(currentConfig.configVersion, manifest, deviceId)
+    if (!decision.shouldUpdateConfig) {
+        return ConfigOutcome(updateAvailable = false, reason = decision.reason, config = currentConfig)
+    }
+
+    val rawText: String = try {
+        httpGet(resolveUrl(manifest.configUrl, updateUrl))
+    } catch (e: Exception) {
+        return ConfigOutcome(false, UpdateReason.ERROR, currentConfig, "Config fetch failed: ${e.message ?: e}")
+    }
+
+    if (!verifyChecksum(rawText, manifest.checksum)) {
+        return ConfigOutcome(false, UpdateReason.CHECKSUM_MISMATCH, currentConfig, "Downloaded config failed checksum verification")
+    }
+
+    val parsedJson: JSONObject = try {
+        JSONObject(rawText)
+    } catch (e: Exception) {
+        return ConfigOutcome(false, UpdateReason.ERROR, currentConfig, "Config JSON parse failed: ${e.message ?: e}")
+    }
+
+    if (!QualityConfig.isValid(parsedJson)) {
+        return ConfigOutcome(false, UpdateReason.INVALID_CONFIG, currentConfig, "Downloaded config failed schema validation")
+    }
+
+    return ConfigOutcome(updateAvailable = true, reason = decision.reason, config = QualityConfig.fromJson(parsedJson))
+}
+
+private data class ModelOutcome(
+    val modelUpdateAvailable: Boolean,
+    val modelReason: UpdateReason,
+    val model: ObjectPresenceModel? = null,
+    val modelError: String? = null
+)
+
 /**
- * Fetches `updateUrl` (expected to point at a version.json-shaped manifest),
- * decides whether a newer config is available for this device, and if so
- * downloads + validates it. Uses plain `HttpURLConnection` off the main
- * thread (Dispatchers.IO) - no HTTP client dependency needed.
+ * Model-only half of the check, run against the SAME already-fetched
+ * manifest as the config half - no extra network round-trip to re-fetch
+ * version.json. Mirrors [resolveConfigUpdate]'s fetch/checksum/validate
+ * shape exactly, using manifest.modelUrl/modelChecksum instead. Never
+ * throws: every failure mode resolves to `modelUpdateAvailable = false` so a
+ * broken model publish can never brick a capture flow.
+ */
+private suspend fun resolveModelUpdate(updateUrl: String, manifest: SDKVersionInfo, currentModelVersion: String, deviceId: String): ModelOutcome {
+    val decision = decideModelUpdate(currentModelVersion, manifest, deviceId)
+    if (!decision.shouldUpdateModel) {
+        return ModelOutcome(modelUpdateAvailable = false, modelReason = decision.reason)
+    }
+
+    val rawText: String = try {
+        httpGet(resolveUrl(manifest.modelUrl!!, updateUrl))
+    } catch (e: Exception) {
+        return ModelOutcome(false, UpdateReason.ERROR, modelError = "Model fetch failed: ${e.message ?: e}")
+    }
+
+    if (!verifyChecksum(rawText, manifest.modelChecksum)) {
+        return ModelOutcome(false, UpdateReason.CHECKSUM_MISMATCH, modelError = "Downloaded model failed checksum verification")
+    }
+
+    val parsedJson: JSONObject = try {
+        JSONObject(rawText)
+    } catch (e: Exception) {
+        return ModelOutcome(false, UpdateReason.ERROR, modelError = "Model JSON parse failed: ${e.message ?: e}")
+    }
+
+    if (!ObjectPresenceModel.isValid(parsedJson)) {
+        return ModelOutcome(false, UpdateReason.INVALID_MODEL, modelError = "Downloaded model failed schema validation")
+    }
+
+    return ModelOutcome(modelUpdateAvailable = true, modelReason = decision.reason, model = ObjectPresenceModel.fromJson(parsedJson))
+}
+
+/**
+ * Fetches `updateUrl` (expected to point at a version.json-shaped manifest)
+ * ONCE, then independently decides/downloads/validates a newer config and a
+ * newer object-presence model against that same manifest. Uses plain
+ * `HttpURLConnection` off the main thread (Dispatchers.IO) - no HTTP client
+ * dependency needed.
  *
  * Never throws: every failure mode (network error, bad JSON, checksum
  * mismatch, schema validation failure) resolves to an [UpdateResult] with
- * `updateAvailable = false` and `config = currentConfig`, so a broken
- * publish or a flaky network can never brick a capture flow.
+ * `updateAvailable = false` and `config = currentConfig` (and the
+ * model-side fields analogously), so a broken publish or a flaky network
+ * can never brick a capture flow.
  */
-suspend fun checkForUpdates(updateUrl: String, currentConfig: QualityConfig, deviceId: String): UpdateResult =
-    withContext(Dispatchers.IO) {
-        val manifest: SDKVersionInfo = try {
-            val body = httpGet(updateUrl)
-            SDKVersionInfo.fromJson(JSONObject(body))
-        } catch (e: Exception) {
-            return@withContext UpdateResult(
-                updateAvailable = false,
-                reason = UpdateReason.ERROR,
-                config = currentConfig,
-                error = e.message ?: e.toString()
-            )
-        }
-
-        val decision = decideUpdate(currentConfig.configVersion, manifest, deviceId)
-        if (!decision.shouldUpdateConfig) {
-            return@withContext UpdateResult(
-                updateAvailable = false,
-                reason = decision.reason,
-                config = currentConfig,
-                version = manifest
-            )
-        }
-
-        val rawText: String = try {
-            val configUrl = resolveUrl(manifest.configUrl, updateUrl)
-            httpGet(configUrl)
-        } catch (e: Exception) {
-            return@withContext UpdateResult(
-                updateAvailable = false,
-                reason = UpdateReason.ERROR,
-                config = currentConfig,
-                version = manifest,
-                error = "Config fetch failed: ${e.message ?: e}"
-            )
-        }
-
-        val checksumOk = verifyChecksum(rawText, manifest.checksum)
-        if (!checksumOk) {
-            return@withContext UpdateResult(
-                updateAvailable = false,
-                reason = UpdateReason.CHECKSUM_MISMATCH,
-                config = currentConfig,
-                version = manifest,
-                error = "Downloaded config failed checksum verification"
-            )
-        }
-
-        val parsedJson: JSONObject = try {
-            JSONObject(rawText)
-        } catch (e: Exception) {
-            return@withContext UpdateResult(
-                updateAvailable = false,
-                reason = UpdateReason.ERROR,
-                config = currentConfig,
-                version = manifest,
-                error = "Config JSON parse failed: ${e.message ?: e}"
-            )
-        }
-
-        if (!QualityConfig.isValid(parsedJson)) {
-            return@withContext UpdateResult(
-                updateAvailable = false,
-                reason = UpdateReason.INVALID_CONFIG,
-                config = currentConfig,
-                version = manifest,
-                error = "Downloaded config failed schema validation"
-            )
-        }
-
-        val parsedConfig = QualityConfig.fromJson(parsedJson)
-        UpdateResult(
-            updateAvailable = true,
-            reason = decision.reason,
-            config = parsedConfig,
-            version = manifest
+suspend fun checkForUpdates(
+    updateUrl: String,
+    currentConfig: QualityConfig,
+    deviceId: String,
+    currentModelVersion: String = "0.0.0"
+): UpdateResult = withContext(Dispatchers.IO) {
+    val manifest: SDKVersionInfo = try {
+        val body = httpGet(updateUrl)
+        SDKVersionInfo.fromJson(JSONObject(body))
+    } catch (e: Exception) {
+        return@withContext UpdateResult(
+            updateAvailable = false,
+            reason = UpdateReason.ERROR,
+            config = currentConfig,
+            error = e.message ?: e.toString()
         )
     }
+
+    val configOutcome = resolveConfigUpdate(updateUrl, manifest, currentConfig, deviceId)
+    val modelOutcome = resolveModelUpdate(updateUrl, manifest, currentModelVersion, deviceId)
+
+    UpdateResult(
+        updateAvailable = configOutcome.updateAvailable,
+        reason = configOutcome.reason,
+        config = configOutcome.config,
+        version = manifest,
+        error = configOutcome.error,
+        modelUpdateAvailable = modelOutcome.modelUpdateAvailable,
+        model = modelOutcome.model,
+        modelReason = modelOutcome.modelReason,
+        modelError = modelOutcome.modelError
+    )
+}
 
 /**
  * Stateful wrapper around the pure [checkForUpdates] function: holds the
@@ -283,16 +375,30 @@ class ConfigUpdateManager(
     private val baseUrl: String,
     private val store: PersistentStore,
     private val deviceId: String,
-    initialConfig: QualityConfig = loadPersisted(store) ?: QualityConfig.DEFAULT,
+    initialConfig: QualityConfig = loadPersistedConfig(store) ?: QualityConfig.DEFAULT,
+    initialModel: ObjectPresenceModel? = loadPersistedModel(store),
     private val onConfigUpdated: ((QualityConfig) -> Unit)? = null,
+    /**
+     * Fired AFTER this manager has already fetched, validated, and applied a
+     * new model itself (see [checkForUpdatesSuspend]) - purely informational
+     * now, kept for backward source compatibility with app code that already
+     * wired it up. Use [getObjectPresenceModel] to read the applied model
+     * directly instead of re-downloading it from the URL this hands back.
+     */
     private val onModelAvailable: ((modelUrl: String, modelVersion: String) -> Unit)? = null
 ) {
     @Volatile
     private var currentConfig: QualityConfig = initialConfig
 
+    @Volatile
+    private var currentModel: ObjectPresenceModel? = initialModel
+
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
 
     fun getConfig(): QualityConfig = currentConfig
+
+    /** The currently-applied object-presence model, or null if none has ever been fetched/published. */
+    fun getObjectPresenceModel(): ObjectPresenceModel? = currentModel
 
     private fun versionUrl(): String {
         val trimmed = baseUrl.trimEnd('/')
@@ -301,7 +407,7 @@ class ConfigUpdateManager(
 
     /** Suspend API - preferred for callers already using coroutines. */
     suspend fun checkForUpdatesSuspend(): UpdateResult {
-        val result = checkForUpdates(versionUrl(), currentConfig, deviceId)
+        val result = checkForUpdates(versionUrl(), currentConfig, deviceId, currentModel?.modelVersion ?: "0.0.0")
         if (result.updateAvailable) {
             currentConfig = result.config
             try {
@@ -312,8 +418,15 @@ class ConfigUpdateManager(
             }
             onConfigUpdated?.invoke(result.config)
         }
-        if (result.version?.modelUrl != null && result.version.latestModelVersion != null) {
-            onModelAvailable?.invoke(resolveUrl(result.version.modelUrl, versionUrl()), result.version.latestModelVersion)
+        if (result.modelUpdateAvailable && result.model != null) {
+            currentModel = result.model
+            try {
+                store.set(MODEL_STORAGE_KEY, result.model.toJson().toString())
+            } catch (e: Exception) {
+                // Persistence failure shouldn't stop the new model from being
+                // used for the rest of this session.
+            }
+            onModelAvailable?.invoke(resolveUrl(result.version?.modelUrl ?: "", versionUrl()), result.model.modelVersion)
         }
         return result
     }
@@ -332,11 +445,21 @@ class ConfigUpdateManager(
     }
 
     companion object {
-        private fun loadPersisted(store: PersistentStore): QualityConfig? {
+        private fun loadPersistedConfig(store: PersistentStore): QualityConfig? {
             val raw = store.get(CONFIG_STORAGE_KEY) ?: return null
             return try {
                 val json = JSONObject(raw)
                 if (QualityConfig.isValid(json)) QualityConfig.fromJson(json) else null
+            } catch (e: Exception) {
+                null
+            }
+        }
+
+        private fun loadPersistedModel(store: PersistentStore): ObjectPresenceModel? {
+            val raw = store.get(MODEL_STORAGE_KEY) ?: return null
+            return try {
+                val json = JSONObject(raw)
+                if (ObjectPresenceModel.isValid(json)) ObjectPresenceModel.fromJson(json) else null
             } catch (e: Exception) {
                 null
             }

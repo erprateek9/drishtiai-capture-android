@@ -6,6 +6,7 @@ import androidx.camera.core.ImageAnalysis
 import com.drishtiai.capture.camera.CameraXAnalyzer
 import com.drishtiai.capture.model.CaptureDecision
 import com.drishtiai.capture.model.FrameAnalysisResult
+import com.drishtiai.capture.model.ObjectPresenceModel
 import com.drishtiai.capture.model.QualityConfig
 import com.drishtiai.capture.scoring.ScoringEngine
 import com.drishtiai.capture.storage.SharedPreferencesStore
@@ -30,12 +31,18 @@ class DrishtiCaptureSDK private constructor(
 ) {
     fun getConfig(): QualityConfig = updateManager.getConfig()
 
+    /** The currently-applied object-presence model, or null if none has ever been fetched/published. */
+    fun getObjectPresenceModel(): ObjectPresenceModel? = updateManager.getObjectPresenceModel()
+
     /**
      * Synchronous scoring of a captured photo - safe to call on a background
      * thread. Performs the true RGBA-weighted grayscale conversion (see
-     * ImageUtils.toGrayscale) so the score reflects the actual saved image.
+     * ImageUtils.toGrayscale) so the score reflects the actual saved image,
+     * and - once a trained model has been fetched via [checkForUpdates] -
+     * runs real object-presence inference instead of the neutral-pass stub.
      */
-    fun analyzeFrame(bitmap: Bitmap): FrameAnalysisResult = ScoringEngine.analyzeFrame(bitmap, getConfig())
+    fun analyzeFrame(bitmap: Bitmap): FrameAnalysisResult =
+        ScoringEngine.analyzeFrame(bitmap, getConfig(), model = getObjectPresenceModel())
 
     /** Derives the boolean-friendly capture decision from a [FrameAnalysisResult]. */
     fun getCaptureDecision(result: FrameAnalysisResult): CaptureDecision =

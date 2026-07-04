@@ -7,8 +7,12 @@ import com.drishtiai.capture.model.CheckStatus
 import com.drishtiai.capture.model.FrameAnalysisResult
 import com.drishtiai.capture.model.FrameHistoryEntry
 import com.drishtiai.capture.model.IssueCode
+import com.drishtiai.capture.model.ObjectPresenceFeatureKeys
+import com.drishtiai.capture.model.ObjectPresenceFeatures
+import com.drishtiai.capture.model.ObjectPresenceModel
 import com.drishtiai.capture.model.QualityCheckResult
 import com.drishtiai.capture.model.QualityConfig
+import kotlin.math.exp
 import kotlin.math.roundToInt
 
 /**
@@ -168,13 +172,91 @@ object ScoringEngine {
     }
 
     /**
-     * Placeholder for future package/object presence detection. Always
-     * returns a neutral pass so it never blocks capture, but is wired into
-     * the weighted score so enabling a real model later requires no changes
-     * to the scoring engine.
+     * Assembles the object-presence feature vector for one frame, reusing
+     * the scalars [analyzeFrame] already computed for the other checks
+     * (meanBrightness/stdDev/edgeDensity/laplacianVariance) rather than
+     * recomputing them - same "cheap to reuse, expensive to recompute"
+     * discipline as every other check here. Mirrors
+     * sdk-core/src/quality/objectPresenceFeatures.ts's
+     * `extractObjectPresenceFeatures`.
+     */
+    fun extractObjectPresenceFeatures(
+        bitmap: Bitmap,
+        gray: DoubleArray,
+        meanBrightness: Double,
+        stdDevValue: Double,
+        edgeDensityValue: Double,
+        laplacianVarianceValue: Double
+    ): ObjectPresenceFeatures {
+        val (meanSaturation, stdDevSaturation) = ImageUtils.saturationStats(bitmap)
+        return ObjectPresenceFeatures(
+            meanBrightness = meanBrightness,
+            stdDevBrightness = stdDevValue,
+            edgeDensityFull = edgeDensityValue,
+            laplacianVariance = laplacianVarianceValue,
+            centerVsEdgeDetailRatio = ImageUtils.centerVsEdgeDetailRatio(gray, bitmap.width, bitmap.height),
+            meanSaturation = meanSaturation,
+            stdDevSaturation = stdDevSaturation
+        )
+    }
+
+    private fun sigmoid(z: Double): Double = 1.0 / (1.0 + exp(-z))
+
+    /**
+     * No-features overload: the same neutral-pass stub this check has always
+     * returned. Used by the grayscale-only live-preview path ([analyzeFrame]
+     * with a bare `DoubleArray`), which has no RGBA data available and so
+     * cannot compute the saturation feature real object-presence inference
+     * needs - this is a deliberate, permanent scope boundary (mirroring this
+     * SDK's existing "the live-preview score is an approximation, the final
+     * captured-Bitmap score is truth" philosophy), not a temporary gap. Real
+     * model-backed inference only ever runs via the featureful overload
+     * below, called from the Bitmap-based [analyzeFrame] wrapper.
      */
     fun checkObjectPresence(): QualityCheckResult =
         QualityCheckResult(value = 1.0, score = 100, status = CheckStatus.PASS)
+
+    /**
+     * Detects whether a real shipment object is present in the frame, as
+     * opposed to a random/irrelevant photo.
+     *
+     * [model] is null whenever the caller hasn't loaded a trained model yet
+     * (including every SDK instance before the very first model is ever
+     * published) - in that case this returns the exact same neutral-pass
+     * result this check has always returned, so nothing crashes or blocks
+     * capture. Mirrors sdk-core/src/quality/objectPresence.ts's
+     * `checkObjectPresence` math exactly (standardize -> dot product + bias
+     * -> sigmoid -> score/status/issue).
+     */
+    fun checkObjectPresence(features: ObjectPresenceFeatures, model: ObjectPresenceModel?): QualityCheckResult {
+        if (model == null) {
+            return QualityCheckResult(value = 1.0, score = 100, status = CheckStatus.PASS)
+        }
+
+        val rawFeatures = features.toMap()
+        var z = model.bias
+        for (key in ObjectPresenceFeatureKeys.ALL) {
+            val mean = model.featureMeans[key] ?: 0.0
+            val stdDev = model.featureStdDevs[key]?.takeIf { it != 0.0 } ?: 1.0
+            val standardized = ((rawFeatures[key] ?: 0.0) - mean) / stdDev
+            z += standardized * (model.weights[key] ?: 0.0)
+        }
+
+        val probability = sigmoid(z)
+        val score = (probability * 100).roundToInt()
+        val cutoff = model.threshold
+
+        val passed = probability >= cutoff
+        val warnBand = cutoff * 0.6
+        val status = if (passed) CheckStatus.PASS else if (probability >= warnBand) CheckStatus.WARN else CheckStatus.FAIL
+
+        return QualityCheckResult(
+            value = probability,
+            score = score,
+            status = status,
+            issue = if (status == CheckStatus.FAIL) IssueCode.OBJECT_NOT_DETECTED else null
+        )
+    }
 
     /**
      * Placeholder for multi-frame hand-shake/motion stability detection. A
@@ -278,13 +360,22 @@ object ScoringEngine {
      * bitmaps (RGBA->grayscale via [ImageUtils.toGrayscale]) funnel into
      * this single function so the scoring math is identical regardless of
      * how the grayscale array was produced.
+     *
+     * [objectPresenceOverride] lets the Bitmap-based [analyzeFrame] wrapper
+     * below inject a real model-backed objectPresence result (it has RGBA
+     * data available for the saturation feature; this grayscale-only path
+     * does not) without duplicating the rest of this function's
+     * aggregation/weighting logic. Omitted (null) - the default for every
+     * grayscale-only caller, e.g. the live-preview path - falls back to the
+     * neutral-pass stub, exactly as before this parameter existed.
      */
     fun analyzeFrame(
         gray: DoubleArray,
         width: Int,
         height: Int,
         config: QualityConfig,
-        frameHistory: List<FrameHistoryEntry>? = null
+        frameHistory: List<FrameHistoryEntry>? = null,
+        objectPresenceOverride: QualityCheckResult? = null
     ): FrameAnalysisResult {
         val meanBrightness = ImageUtils.mean(gray)
 
@@ -294,7 +385,7 @@ object ScoringEngine {
         val overexposure = checkOverexposure(ImageUtils.overexposedRatio(gray), config)
         val contrast = checkContrast(ImageUtils.stdDev(gray, meanBrightness), config)
         val edgeDetail = checkEdgeDetail(ImageUtils.edgeDensity(gray, width, height), config)
-        val objectPresence = checkObjectPresence()
+        val objectPresence = objectPresenceOverride ?: checkObjectPresence()
         val stability = checkStability(frameHistory, config)
 
         // LinkedHashMap to preserve insertion order, matching sdk-core's
@@ -354,13 +445,30 @@ object ScoringEngine {
      * the exact RGBA-weighted [ImageUtils.toGrayscale] so the score attached
      * to a saved photo is the true final score (not a live-preview
      * approximation), then delegates to the shared grayscale-array core.
+     *
+     * This is the only path that can run real model-backed object-presence
+     * inference - [model] is optional (defaults to null, the neutral-pass
+     * stub) and, when provided, is scored using features extracted from this
+     * Bitmap's actual RGBA data (the saturation feature needs color, which
+     * the grayscale-only [analyzeFrame] overload never has access to).
      */
     fun analyzeFrame(
         bitmap: Bitmap,
         config: QualityConfig,
-        frameHistory: List<FrameHistoryEntry>? = null
+        frameHistory: List<FrameHistoryEntry>? = null,
+        model: ObjectPresenceModel? = null
     ): FrameAnalysisResult {
         val gray = ImageUtils.toGrayscale(bitmap)
-        return analyzeFrame(gray, bitmap.width, bitmap.height, config, frameHistory)
+        val meanBrightness = ImageUtils.mean(gray)
+        val stdDevValue = ImageUtils.stdDev(gray, meanBrightness)
+        val edgeDensityValue = ImageUtils.edgeDensity(gray, bitmap.width, bitmap.height)
+        val laplacianVarianceValue = ImageUtils.laplacianVariance(gray, bitmap.width, bitmap.height)
+
+        val features = extractObjectPresenceFeatures(
+            bitmap, gray, meanBrightness, stdDevValue, edgeDensityValue, laplacianVarianceValue
+        )
+        val objectPresence = checkObjectPresence(features, model)
+
+        return analyzeFrame(gray, bitmap.width, bitmap.height, config, frameHistory, objectPresence)
     }
 }

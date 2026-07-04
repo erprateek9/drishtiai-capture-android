@@ -1,6 +1,7 @@
 package com.drishtiai.capture
 
 import com.drishtiai.capture.update.compareVersions
+import com.drishtiai.capture.update.decideModelUpdate
 import com.drishtiai.capture.update.decideUpdate
 import com.drishtiai.capture.update.rolloutBucket
 import com.drishtiai.capture.update.SDKVersionInfo
@@ -47,14 +48,15 @@ class ConfigUpdateManagerTest {
 
     private fun manifest(
         latestConfigVersion: String = "1.1.0",
+        latestModelVersion: String? = null,
         forceUpdate: Boolean = false,
         rolloutPercent: Int = 100
     ) = SDKVersionInfo(
         latestConfigVersion = latestConfigVersion,
-        latestModelVersion = null,
+        latestModelVersion = latestModelVersion,
         minSdkVersion = null,
         configUrl = "/storage/configs/x.json",
-        modelUrl = null,
+        modelUrl = if (latestModelVersion != null) "/storage/models/x.json" else null,
         checksum = "",
         rolloutPercent = rolloutPercent,
         forceUpdate = forceUpdate,
@@ -88,5 +90,44 @@ class ConfigUpdateManagerTest {
         val decision = decideUpdate("1.1.0", manifest(latestConfigVersion = "1.1.0", rolloutPercent = 100), "device-1")
         assertEquals(false, decision.shouldUpdateConfig)
         assertEquals(UpdateReason.UP_TO_DATE, decision.reason)
+    }
+
+    @Test
+    fun `decideModelUpdate is permanently up_to_date when no model has ever been published`() {
+        val decision = decideModelUpdate("0.0.0", manifest(latestModelVersion = null), "device-1")
+        assertEquals(false, decision.shouldUpdateModel)
+        assertEquals(UpdateReason.UP_TO_DATE, decision.reason)
+    }
+
+    @Test
+    fun `decideModelUpdate returns forced when manifest force_update is true, ignoring version-rollout`() {
+        val decision = decideModelUpdate(
+            "9.9.9",
+            manifest(latestModelVersion = "1.0.0", forceUpdate = true, rolloutPercent = 0),
+            "device-1"
+        )
+        assertEquals(true, decision.shouldUpdateModel)
+        assertEquals(UpdateReason.FORCED, decision.reason)
+    }
+
+    @Test
+    fun `decideModelUpdate returns new_model when a newer published model exists`() {
+        val decision = decideModelUpdate("0.0.0", manifest(latestModelVersion = "0.0.1"), "device-1")
+        assertEquals(true, decision.shouldUpdateModel)
+        assertEquals(UpdateReason.NEW_MODEL, decision.reason)
+    }
+
+    @Test
+    fun `decideModelUpdate returns up_to_date when the same model version is already loaded`() {
+        val decision = decideModelUpdate("0.0.1", manifest(latestModelVersion = "0.0.1"), "device-1")
+        assertEquals(false, decision.shouldUpdateModel)
+        assertEquals(UpdateReason.UP_TO_DATE, decision.reason)
+    }
+
+    @Test
+    fun `decideModelUpdate returns not_in_rollout when device bucket is outside rollout_percent`() {
+        val decision = decideModelUpdate("0.0.0", manifest(latestModelVersion = "0.0.1", rolloutPercent = 0), "device-1")
+        assertEquals(false, decision.shouldUpdateModel)
+        assertEquals(UpdateReason.NOT_IN_ROLLOUT, decision.reason)
     }
 }

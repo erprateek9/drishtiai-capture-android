@@ -43,7 +43,7 @@ afterEvaluate {
                 from(components["release"])
                 groupId = "com.drishtiai"
                 artifactId = "capture-sdk"
-                version = project.findProperty("VERSION_NAME")?.toString() ?: "1.1.0"
+                version = project.findProperty("VERSION_NAME")?.toString() ?: "1.2.0"
             }
         }
     }

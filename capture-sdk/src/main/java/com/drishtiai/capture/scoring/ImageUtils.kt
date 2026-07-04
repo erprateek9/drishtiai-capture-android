@@ -102,13 +102,34 @@ object ImageUtils {
      * difference exceeds [threshold]. Single pass, no convolution kernel -
      * deliberately cheaper than [laplacianVariance] for a coarse secondary
      * signal.
+     *
+     * Optionally scoped to a sub-region of the frame via [x0]/[y0]/[x1]/[y1]
+     * (default: the full frame) - used by [centerVsEdgeDetailRatio] to
+     * compare center-region detail density against the full-frame value,
+     * sharing this same loop instead of duplicating the gradient-threshold
+     * logic. Mirrors sdk-core/src/utils/imageUtils.ts's `edgeDensity` and its
+     * `BoundingBox` parameter exactly.
      */
-    fun edgeDensity(gray: DoubleArray, width: Int, height: Int, threshold: Double = 15.0): Double {
+    fun edgeDensity(
+        gray: DoubleArray,
+        width: Int,
+        height: Int,
+        threshold: Double = 15.0,
+        x0: Int = 0,
+        y0: Int = 0,
+        x1: Int = width - 1,
+        y1: Int = height - 1
+    ): Double {
         if (width < 2 || height < 2) return 0.0
+        val startX = max(0.0, x0.toDouble()).toInt()
+        val startY = max(0.0, y0.toDouble()).toInt()
+        val endX = min((width - 1).toDouble(), x1.toDouble()).toInt()
+        val endY = min((height - 1).toDouble(), y1.toDouble()).toInt()
+
         var edgeCount = 0
         var total = 0
-        for (y in 0 until height - 1) {
-            for (x in 0 until width - 1) {
+        for (y in startY until endY) {
+            for (x in startX until endX) {
                 val i = y * width + x
                 val dx = kotlin.math.abs(gray[i] - gray[i + 1])
                 val dy = kotlin.math.abs(gray[i] - gray[i + width])
@@ -117,6 +138,61 @@ object ImageUtils {
             }
         }
         return if (total > 0) edgeCount.toDouble() / total else 0.0
+    }
+
+    /**
+     * Center-vs-edge detail ratio: edge density in the inner 50%x50% box of
+     * the frame divided by the full-frame edge density (plus a small epsilon
+     * to avoid divide-by-zero on a blank frame). A real foreground object (a
+     * shipment package) tends to concentrate detail/contrast toward the
+     * center of a reasonably framed photo; a random/no-object frame tends to
+     * spread detail evenly or concentrate it at the edges (e.g. a doorway or
+     * shelf). Ratio > 1 = center-heavy detail, ~1 = uniform, < 1 = edge-heavy.
+     * Mirrors sdk-core/src/utils/imageUtils.ts's `centerVsEdgeDetailRatio`.
+     */
+    fun centerVsEdgeDetailRatio(gray: DoubleArray, width: Int, height: Int, threshold: Double = 15.0): Double {
+        val fullDensity = edgeDensity(gray, width, height, threshold)
+        val x0 = (width * 0.25).toInt()
+        val y0 = (height * 0.25).toInt()
+        val x1 = kotlin.math.ceil(width * 0.75).toInt()
+        val y1 = kotlin.math.ceil(height * 0.75).toInt()
+        val centerDensity = edgeDensity(gray, width, height, threshold, x0, y0, x1, y1)
+        return centerDensity / (fullDensity + 1e-6)
+    }
+
+    /**
+     * Per-pixel saturation proxy `(max(r,g,b) - min(r,g,b)) / max(r,g,b)`,
+     * averaged and standard-deviated across the frame. Computed from the raw
+     * ARGB pixels directly since grayscale alone loses color. Shipment
+     * photos (cardboard, tape, printed labels) trend low-saturation and
+     * fairly uniform; many "random photo" negatives (skin tones, colorful
+     * clothing, cluttered backgrounds) trend higher and more varied - both
+     * the level and the spread are potentially discriminative features.
+     * Mirrors sdk-core/src/utils/imageUtils.ts's `saturationStats`.
+     */
+    fun saturationStats(bitmap: Bitmap): Pair<Double, Double> {
+        val width = bitmap.width
+        val height = bitmap.height
+        val pixelCount = width * height
+        if (pixelCount == 0) return Pair(0.0, 0.0)
+
+        val pixels = IntArray(pixelCount)
+        bitmap.getPixels(pixels, 0, width, 0, 0, width, height)
+
+        val saturations = DoubleArray(pixelCount)
+        for (i in pixels.indices) {
+            val p = pixels[i]
+            val r = (p shr 16) and 0xFF
+            val g = (p shr 8) and 0xFF
+            val b = p and 0xFF
+            val maxC = max(r.toDouble(), max(g.toDouble(), b.toDouble()))
+            val minC = min(r.toDouble(), min(g.toDouble(), b.toDouble()))
+            saturations[i] = if (maxC > 0) (maxC - minC) / maxC else 0.0
+        }
+
+        val meanSaturation = mean(saturations)
+        val stdDevSaturation = stdDev(saturations, meanSaturation)
+        return Pair(meanSaturation, stdDevSaturation)
     }
 
     /** Clamp a number into [lo, hi]. */
